@@ -414,6 +414,7 @@ struct xilinx_dma_tx_descriptor {
  * @tdest: TDEST value for mcdma
  * @has_vflip: S2MM vertical flip
  * @irq_delay: Interrupt delay timeout
+ * @missed_irq_count: The number of interrupts where the tasklets couldn't be scheduled
  */
 struct xilinx_dma_chan {
 	struct xilinx_dma_device *xdev;
@@ -453,6 +454,7 @@ struct xilinx_dma_chan {
 	u16 tdest;
 	bool has_vflip;
 	u8 irq_delay;
+	int missed_irq_count;
 };
 
 /**
@@ -1338,6 +1340,8 @@ static void xilinx_dma_start(struct xilinx_dma_chan *chan)
 	int err;
 	u32 val;
 
+	chan->missed_irq_count = 0;
+
 	dma_ctrl_set(chan, XILINX_DMA_REG_DMACR, XILINX_DMA_DMACR_RUNSTOP);
 
 	/* Wait for the hardware to start */
@@ -1914,7 +1918,18 @@ static irqreturn_t xilinx_dma_irq_handler(int irq, void *data)
 		spin_unlock(&chan->lock);
 	}
 
-	tasklet_schedule(&chan->tasklet);
+	/*
+	* Since the tasklets are being reused, the regular tasklet_schedule() may
+	* fail if the tasklet was already being run.
+	*/
+	if (!test_and_set_bit(TASKLET_STATE_SCHED, &chan->tasklet.state)) {
+		__tasklet_schedule(&chan->tasklet);
+	} else {
+		spin_lock(&chan->lock);
+		chan->missed_irq_count++;
+		spin_unlock(&chan->lock);
+	}
+
 	return IRQ_HANDLED;
 }
 
@@ -2493,6 +2508,13 @@ static int xilinx_dma_terminate_all(struct dma_chan *dchan)
 	}
 
 	xilinx_dma_chan_reset(chan);
+
+	/* Report any issues with missed tasklets */
+	if (chan->missed_irq_count > 0) {
+		dev_err(chan->dev,
+			"Failed to schedule tasklets for %d interrupts.\n", chan->missed_irq_count);
+	}
+
 	/* Remove and free all of the descriptors in the lists */
 	chan->terminating = true;
 	xilinx_dma_free_descriptors(chan);
