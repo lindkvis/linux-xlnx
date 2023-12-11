@@ -410,7 +410,7 @@ struct xilinx_dma_tx_descriptor {
  * @stop_transfer: Differentiate b/w DMA IP's quiesce
  * @tdest: TDEST value for mcdma
  * @has_vflip: S2MM vertical flip
- * @missed_irq_count: The number of interrupts where the tasklets couldn't be scheduled
+ * @tasklet_scheduling_failures: The number of interrupts where the tasklets couldn't be scheduled
  */
 struct xilinx_dma_chan {
 	struct xilinx_dma_device *xdev;
@@ -449,7 +449,7 @@ struct xilinx_dma_chan {
 	int (*stop_transfer)(struct xilinx_dma_chan *chan);
 	u16 tdest;
 	bool has_vflip;
-	int missed_irq_count;
+	int tasklet_scheduling_failures;
 };
 
 /**
@@ -991,6 +991,34 @@ static u32 xilinx_dma_get_residue(struct xilinx_dma_chan *chan,
 }
 
 /**
+  * Since the tasklets are being reused, the regular tasklet_schedule() may
+  * fail if the tasklet was already being run.
+  */
+static void xilinx_schedule_tasklet_for_channel(struct xilinx_dma_chan *chan)
+{
+	if (!test_and_set_bit(TASKLET_STATE_SCHED, &(chan->tasklet.state))) {
+		__tasklet_schedule(&chan->tasklet);
+	} else {
+		spin_lock(&chan->lock);
+		chan->tasklet_scheduling_failures++;
+		spin_unlock(&chan->lock);
+	}
+}
+
+/**
+  * Since the tasklets are being reused, the regular tasklet_schedule() may
+  * fail if the tasklet was already being run. Assumes the channel lock is already held.
+  */
+static void xilinx_reschedule_tasklet_for_channel(struct xilinx_dma_chan *chan)
+{
+	if (!test_and_set_bit(TASKLET_STATE_SCHED, &(chan->tasklet.state))) {
+		__tasklet_schedule(&chan->tasklet);		
+		chan->tasklet_scheduling_failures--;
+	}
+}
+
+
+/**
  * xilinx_dma_chan_handle_cyclic - Cyclic dma callback
  * @chan: Driver specific dma channel
  * @desc: dma transaction descriptor
@@ -1020,6 +1048,11 @@ static void xilinx_dma_chan_desc_cleanup(struct xilinx_dma_chan *chan)
 	unsigned long flags;
 
 	spin_lock_irqsave(&chan->lock, flags);
+
+	/* Reschedule the tasklet if we have at least one uncorrected failure */
+	if (chan->tasklet_scheduling_failures > 0) {
+		xilinx_reschedule_tasklet_for_channel(chan);
+	}
 
 	list_for_each_entry_safe(desc, next, &chan->done_list, node) {
 		struct dmaengine_result result;
@@ -1310,7 +1343,7 @@ static void xilinx_dma_start(struct xilinx_dma_chan *chan)
 	int err;
 	u32 val;
 
-	chan->missed_irq_count = 0;
+	chan->tasklet_scheduling_failures = 0;
 
 	dma_ctrl_set(chan, XILINX_DMA_REG_DMACR, XILINX_DMA_DMACR_RUNSTOP);
 
@@ -1818,7 +1851,7 @@ static irqreturn_t xilinx_mcdma_irq_handler(int irq, void *data)
 		spin_unlock(&chan->lock);
 	}
 
-	tasklet_schedule(&chan->tasklet);
+	xilinx_schedule_tasklet_for_channel(chan);
 	return IRQ_HANDLED;
 }
 
@@ -1881,18 +1914,8 @@ static irqreturn_t xilinx_dma_irq_handler(int irq, void *data)
 		chan->start_transfer(chan);
 		spin_unlock(&chan->lock);
 	}
-
-	/*
-	* Since the tasklets are being reused, the regular tasklet_schedule() may
-	* fail if the tasklet was already being run.
-	*/
-	if (!test_and_set_bit(TASKLET_STATE_SCHED, &chan->tasklet.state)) {
-		__tasklet_schedule(&chan->tasklet);
-	} else {
-		spin_lock(&chan->lock);
-		chan->missed_irq_count++;
-		spin_unlock(&chan->lock);
-	}
+	
+	xilinx_schedule_tasklet_for_channel(chan);
 
 	return IRQ_HANDLED;
 }
@@ -2471,9 +2494,9 @@ static int xilinx_dma_terminate_all(struct dma_chan *dchan)
 	xilinx_dma_chan_reset(chan);
 
 	/* Report any issues with missed tasklets */
-	if (chan->missed_irq_count > 0) {
+	if (chan->tasklet_scheduling_failures > 0) {
 		dev_err(chan->dev,
-			"Failed to schedule tasklets for %d interrupts.\n", chan->missed_irq_count);
+			"Failed to schedule tasklets for %d interrupts.\n", chan->tasklet_scheduling_failures);
 	}
 
 	/* Remove and free all of the descriptors in the lists */
@@ -2918,7 +2941,7 @@ static int xilinx_dma_chan_probe(struct xilinx_dma_device *xdev,
 
 	/* Initialize the tasklet */
 	tasklet_setup(&chan->tasklet, xilinx_dma_do_tasklet);
-
+	
 	/*
 	 * Initialize the DMA channel and add it to the DMA engine channels
 	 * list.
