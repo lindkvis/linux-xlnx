@@ -997,7 +997,7 @@ static u32 xilinx_dma_get_residue(struct xilinx_dma_chan *chan,
 static void xilinx_schedule_tasklet_for_channel(struct xilinx_dma_chan *chan)
 {
 	if (!test_and_set_bit(TASKLET_STATE_SCHED, &(chan->tasklet.state))) {
-		__tasklet_schedule(&chan->tasklet);
+		__tasklet_hi_schedule(&chan->tasklet);
 	} else {
 		spin_lock(&chan->lock);
 		chan->tasklet_scheduling_failures++;
@@ -1012,7 +1012,7 @@ static void xilinx_schedule_tasklet_for_channel(struct xilinx_dma_chan *chan)
 static void xilinx_reschedule_tasklet_for_channel(struct xilinx_dma_chan *chan)
 {
 	if (!test_and_set_bit(TASKLET_STATE_SCHED, &(chan->tasklet.state))) {
-		__tasklet_schedule(&chan->tasklet);		
+		__tasklet_hi_schedule(&chan->tasklet);		
 		chan->tasklet_scheduling_failures--;
 	}
 }
