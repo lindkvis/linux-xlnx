@@ -394,6 +394,7 @@ struct xilinx_dma_tx_descriptor {
  * @genlock: Support genlock mode
  * @err: Channel has errors
  * @idle: Check for channel idle
+ * @terminating: Check for channel being synchronized by user
  * @tasklet: Cleanup work after irq
  * @config: Device configuration info
  * @flush_on_fsync: Flush on Frame sync
@@ -409,6 +410,8 @@ struct xilinx_dma_tx_descriptor {
  * @stop_transfer: Differentiate b/w DMA IP's quiesce
  * @tdest: TDEST value for mcdma
  * @has_vflip: S2MM vertical flip
+ * @irq_delay: Interrupt delay timeout
+ * @tasklet_scheduling_failures: The number of interrupts where the tasklets couldn't be scheduled
  */
 struct xilinx_dma_chan {
 	struct xilinx_dma_device *xdev;
@@ -431,6 +434,7 @@ struct xilinx_dma_chan {
 	bool genlock;
 	bool err;
 	bool idle;
+	bool terminating;
 	struct tasklet_struct tasklet;
 	struct xilinx_vdma_config config;
 	bool flush_on_fsync;
@@ -446,6 +450,8 @@ struct xilinx_dma_chan {
 	int (*stop_transfer)(struct xilinx_dma_chan *chan);
 	u16 tdest;
 	bool has_vflip;
+	u8 irq_delay;
+	int tasklet_scheduling_failures;
 };
 
 /**
@@ -800,7 +806,7 @@ xilinx_dma_alloc_tx_descriptor(struct xilinx_dma_chan *chan)
 {
 	struct xilinx_dma_tx_descriptor *desc;
 
-	desc = kzalloc(sizeof(*desc), GFP_KERNEL);
+	desc = kzalloc(sizeof(*desc), GFP_NOWAIT);
 	if (!desc)
 		return NULL;
 
@@ -987,6 +993,34 @@ static u32 xilinx_dma_get_residue(struct xilinx_dma_chan *chan,
 }
 
 /**
+  * Since the tasklets are being reused, the regular tasklet_schedule() may
+  * fail if the tasklet was already being run.
+  */
+static void xilinx_schedule_tasklet_for_channel(struct xilinx_dma_chan *chan)
+{
+	if (!test_and_set_bit(TASKLET_STATE_SCHED, &(chan->tasklet.state))) {
+		__tasklet_hi_schedule(&chan->tasklet);
+	} else {
+		spin_lock(&chan->lock);
+		chan->tasklet_scheduling_failures++;
+		spin_unlock(&chan->lock);
+	}
+}
+
+/**
+  * Since the tasklets are being reused, the regular tasklet_schedule() may
+  * fail if the tasklet was already being run. Assumes the channel lock is already held.
+  */
+static void xilinx_reschedule_tasklet_for_channel(struct xilinx_dma_chan *chan)
+{
+	if (!test_and_set_bit(TASKLET_STATE_SCHED, &(chan->tasklet.state))) {
+		__tasklet_hi_schedule(&chan->tasklet);		
+		chan->tasklet_scheduling_failures--;
+	}
+}
+
+
+/**
  * xilinx_dma_chan_handle_cyclic - Cyclic dma callback
  * @chan: Driver specific dma channel
  * @desc: dma transaction descriptor
@@ -996,14 +1030,12 @@ static void xilinx_dma_chan_handle_cyclic(struct xilinx_dma_chan *chan,
 					  struct xilinx_dma_tx_descriptor *desc,
 					  unsigned long *flags)
 {
-	dma_async_tx_callback callback;
-	void *callback_param;
+	struct dmaengine_desc_callback cb;
 
-	callback = desc->async_tx.callback;
-	callback_param = desc->async_tx.callback_param;
-	if (callback) {
+	dmaengine_desc_get_callback(&desc->async_tx, &cb);
+	if (dmaengine_desc_callback_valid(&cb)) {
 		spin_unlock_irqrestore(&chan->lock, *flags);
-		callback(callback_param);
+		dmaengine_desc_callback_invoke(&cb, NULL);
 		spin_lock_irqsave(&chan->lock, *flags);
 	}
 }
@@ -1018,6 +1050,11 @@ static void xilinx_dma_chan_desc_cleanup(struct xilinx_dma_chan *chan)
 	unsigned long flags;
 
 	spin_lock_irqsave(&chan->lock, flags);
+
+	/* Reschedule the tasklet if we have at least one uncorrected failure */
+	if (chan->tasklet_scheduling_failures > 0) {
+		xilinx_reschedule_tasklet_for_channel(chan);
+	}
 
 	list_for_each_entry_safe(desc, next, &chan->done_list, node) {
 		struct dmaengine_result result;
@@ -1049,6 +1086,13 @@ static void xilinx_dma_chan_desc_cleanup(struct xilinx_dma_chan *chan)
 		/* Run any dependencies, then free the descriptor */
 		dma_run_dependencies(&desc->async_tx);
 		xilinx_dma_free_tx_descriptor(chan, desc);
+
+		/*
+		 * While we ran a callback the user called a terminate function,
+		 * which takes care of cleaning up any remaining descriptors
+		 */
+		if (chan->terminating)
+			break;
 	}
 
 	spin_unlock_irqrestore(&chan->lock, flags);
@@ -1301,6 +1345,8 @@ static void xilinx_dma_start(struct xilinx_dma_chan *chan)
 	int err;
 	u32 val;
 
+	chan->tasklet_scheduling_failures = 0;
+
 	dma_ctrl_set(chan, XILINX_DMA_REG_DMACR, XILINX_DMA_DMACR_RUNSTOP);
 
 	/* Wait for the hardware to start */
@@ -1411,8 +1457,7 @@ static void xilinx_vdma_start_transfer(struct xilinx_dma_chan *chan)
 
 	chan->desc_submitcount++;
 	chan->desc_pendingcount--;
-	list_del(&desc->node);
-	list_add_tail(&desc->node, &chan->active_list);
+	list_move_tail(&desc->node, &chan->active_list);
 	if (chan->desc_submitcount == chan->num_frms)
 		chan->desc_submitcount = 0;
 
@@ -1650,6 +1695,17 @@ static void xilinx_dma_issue_pending(struct dma_chan *dchan)
 }
 
 /**
+ * xilinx_dma_device_config - Configure the DMA channel
+ * @dchan: DMA channel
+ * @config: channel configuration
+ */
+static int xilinx_dma_device_config(struct dma_chan *dchan,
+				    struct dma_slave_config *config)
+{
+	return 0;
+}
+
+/**
  * xilinx_dma_complete_descriptor - Mark the active descriptor as complete
  * @chan : xilinx DMA channel
  *
@@ -1797,7 +1853,7 @@ static irqreturn_t xilinx_mcdma_irq_handler(int irq, void *data)
 		spin_unlock(&chan->lock);
 	}
 
-	tasklet_schedule(&chan->tasklet);
+	xilinx_schedule_tasklet_for_channel(chan);
 	return IRQ_HANDLED;
 }
 
@@ -1860,8 +1916,9 @@ static irqreturn_t xilinx_dma_irq_handler(int irq, void *data)
 		chan->start_transfer(chan);
 		spin_unlock(&chan->lock);
 	}
+	
+	xilinx_schedule_tasklet_for_channel(chan);
 
-	tasklet_schedule(&chan->tasklet);
 	return IRQ_HANDLED;
 }
 
@@ -1964,6 +2021,8 @@ static dma_cookie_t xilinx_dma_tx_submit(struct dma_async_tx_descriptor *tx)
 
 	if (desc->cyclic)
 		chan->cyclic = true;
+
+	chan->terminating = false;
 
 	spin_unlock_irqrestore(&chan->lock, flags);
 
@@ -2435,7 +2494,15 @@ static int xilinx_dma_terminate_all(struct dma_chan *dchan)
 	}
 
 	xilinx_dma_chan_reset(chan);
+
+	/* Report any issues with missed tasklets */
+	if (chan->tasklet_scheduling_failures > 0) {
+		dev_err(chan->dev,
+			"Failed to schedule tasklets for %d interrupts.\n", chan->tasklet_scheduling_failures);
+	}
+
 	/* Remove and free all of the descriptors in the lists */
+	chan->terminating = true;
 	xilinx_dma_free_descriptors(chan);
 	chan->idle = true;
 
@@ -2451,6 +2518,13 @@ static int xilinx_dma_terminate_all(struct dma_chan *dchan)
 			     XILINX_CDMA_CR_SGMODE);
 
 	return 0;
+}
+
+static void xilinx_dma_synchronize(struct dma_chan *dchan)
+{
+	struct xilinx_dma_chan *chan = to_xilinx_chan(dchan);
+
+	tasklet_kill(&chan->tasklet);
 }
 
 /**
@@ -2781,8 +2855,7 @@ static int xilinx_dma_chan_probe(struct xilinx_dma_device *xdev,
 		has_dre = false;
 
 	if (!has_dre)
-		xdev->common.copy_align = (enum dmaengine_alignment)
-						fls(width - 1);
+		xdev->common.copy_align = (enum dmaengine_alignment)fls(width - 1);
 
 	if (of_device_is_compatible(node, "xlnx,axi-vdma-mm2s-channel") ||
 	    of_device_is_compatible(node, "xlnx,axi-dma-mm2s-channel") ||
@@ -2834,7 +2907,9 @@ static int xilinx_dma_chan_probe(struct xilinx_dma_device *xdev,
 	}
 
 	/* Request the interrupt */
-	chan->irq = irq_of_parse_and_map(node, chan->tdest);
+	chan->irq = of_irq_get(node, chan->tdest);
+	if (chan->irq < 0)
+		return dev_err_probe(xdev->dev, chan->irq, "failed to get irq\n");
 	err = request_irq(chan->irq, xdev->dma_config->irq_handler,
 			  IRQF_SHARED, "xilinx-dma-controller", chan);
 	if (err) {
@@ -3012,9 +3087,10 @@ static int xilinx_dma_probe(struct platform_device *pdev)
 
 	/* Request and map I/O memory */
 	xdev->regs = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(xdev->regs))
-		return PTR_ERR(xdev->regs);
-
+	if (IS_ERR(xdev->regs)) {
+		err = PTR_ERR(xdev->regs);
+		goto disable_clks;
+	}
 	/* Retrieve the DMA engine properties from the device tree */
 	xdev->max_buffer_len = GENMASK(XILINX_DMA_MAX_TRANS_LEN_MAX - 1, 0);
 	xdev->s2mm_chan_id = xdev->dma_config->max_channels / 2;
@@ -3042,7 +3118,7 @@ static int xilinx_dma_probe(struct platform_device *pdev)
 		if (err < 0) {
 			dev_err(xdev->dev,
 				"missing xlnx,num-fstores property\n");
-			return err;
+			goto disable_clks;
 		}
 
 		err = of_property_read_u32(node, "xlnx,flush-fsync",
@@ -3062,7 +3138,11 @@ static int xilinx_dma_probe(struct platform_device *pdev)
 		xdev->ext_addr = false;
 
 	/* Set the dma mask bits */
-	dma_set_mask_and_coherent(xdev->dev, DMA_BIT_MASK(addr_width));
+	err = dma_set_mask_and_coherent(xdev->dev, DMA_BIT_MASK(addr_width));
+	if (err < 0) {
+		dev_err(xdev->dev, "DMA mask error %d\n", err);
+		goto disable_clks;
+	}
 
 	/* Initialize the DMA engine */
 	xdev->common.dev = &pdev->dev;
@@ -3078,8 +3158,10 @@ static int xilinx_dma_probe(struct platform_device *pdev)
 	xdev->common.device_free_chan_resources =
 				xilinx_dma_free_chan_resources;
 	xdev->common.device_terminate_all = xilinx_dma_terminate_all;
+	xdev->common.device_synchronize = xilinx_dma_synchronize;
 	xdev->common.device_tx_status = xilinx_dma_tx_status;
 	xdev->common.device_issue_pending = xilinx_dma_issue_pending;
+	xdev->common.device_config = xilinx_dma_device_config;
 	if (xdev->dma_config->dmatype == XDMA_TYPE_AXIDMA) {
 		dma_cap_set(DMA_CYCLIC, xdev->common.cap_mask);
 		xdev->common.device_prep_slave_sg = xilinx_dma_prep_slave_sg;
@@ -3107,7 +3189,7 @@ static int xilinx_dma_probe(struct platform_device *pdev)
 	for_each_child_of_node(node, child) {
 		err = xilinx_dma_child_probe(xdev, child);
 		if (err < 0)
-			goto disable_clks;
+			goto error;
 	}
 
 	if (xdev->dma_config->dmatype == XDMA_TYPE_VDMA) {
@@ -3142,12 +3224,12 @@ static int xilinx_dma_probe(struct platform_device *pdev)
 
 	return 0;
 
-disable_clks:
-	xdma_disable_allclks(xdev);
 error:
 	for (i = 0; i < xdev->dma_config->max_channels; i++)
 		if (xdev->chan[i])
 			xilinx_dma_chan_remove(xdev->chan[i]);
+disable_clks:
+	xdma_disable_allclks(xdev);
 
 	return err;
 }
