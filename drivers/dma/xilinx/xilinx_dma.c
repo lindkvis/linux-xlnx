@@ -450,6 +450,7 @@ struct xilinx_dma_chan {
 	u16 tdest;
 	bool has_vflip;
 	int tasklet_scheduling_failures;
+	int max_tasklet_scheduling_failures;
 };
 
 /**
@@ -1001,6 +1002,9 @@ static void xilinx_schedule_tasklet_for_channel(struct xilinx_dma_chan *chan)
 	} else {
 		spin_lock(&chan->lock);
 		chan->tasklet_scheduling_failures++;
+		if (chan->tasklet_scheduling_failures > chan->max_tasklet_scheduling_failures) {
+			chan->max_tasklet_scheduling_failures = chan->tasklet_scheduling_failures;
+		}
 		spin_unlock(&chan->lock);
 	}
 }
@@ -1344,6 +1348,7 @@ static void xilinx_dma_start(struct xilinx_dma_chan *chan)
 	u32 val;
 
 	chan->tasklet_scheduling_failures = 0;
+	chan->max_tasklet_scheduling_failures = 0;
 
 	dma_ctrl_set(chan, XILINX_DMA_REG_DMACR, XILINX_DMA_DMACR_RUNSTOP);
 
@@ -2494,9 +2499,9 @@ static int xilinx_dma_terminate_all(struct dma_chan *dchan)
 	xilinx_dma_chan_reset(chan);
 
 	/* Report any issues with missed tasklets */
-	if (chan->tasklet_scheduling_failures > 0) {
+	if (chan->tasklet_scheduling_failures > 0 || chan->max_tasklet_scheduling_failures > 0) {
 		dev_err(chan->dev,
-			"Failed to schedule tasklets for %d interrupts.\n", chan->tasklet_scheduling_failures);
+			"Failed to schedule tasklets for %d interrupts. Max was %d\n", chan->tasklet_scheduling_failures, chan->max_tasklet_scheduling_failures);
 	}
 
 	/* Remove and free all of the descriptors in the lists */
