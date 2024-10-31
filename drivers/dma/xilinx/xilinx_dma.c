@@ -215,6 +215,8 @@
 #define XILINX_MCDMA_BD_EOP			BIT(30)
 #define XILINX_MCDMA_BD_SOP			BIT(31)
 
+#define XILINX_DMA_MAX_RESCHEDULED_TASKLETS 12
+
 /**
  * struct xilinx_vdma_desc_hw - Hardware Descriptor
  * @next_desc: Next Descriptor Pointer @0x00
@@ -1001,7 +1003,11 @@ static void xilinx_schedule_tasklet_for_channel(struct xilinx_dma_chan *chan)
 		__tasklet_hi_schedule(&chan->tasklet);
 	} else {
 		spin_lock(&chan->lock);
-		chan->tasklet_scheduling_failures++;
+
+		if (chan->tasklet_scheduling_failures < XILINX_DMA_MAX_RESCHEDULED_TASKLETS) {
+			chan->tasklet_scheduling_failures++;
+		}
+
 		if (chan->tasklet_scheduling_failures > chan->max_tasklet_scheduling_failures) {
 			chan->max_tasklet_scheduling_failures = chan->tasklet_scheduling_failures;
 		}
