@@ -215,7 +215,7 @@
 #define XILINX_MCDMA_BD_EOP			BIT(30)
 #define XILINX_MCDMA_BD_SOP			BIT(31)
 
-#define XILINX_DMA_MAX_RESCHEDULED_TASKLETS 12
+#define XILINX_DMA_MAX_RESCHEDULED_TASKLETS 24
 
 /**
  * struct xilinx_vdma_desc_hw - Hardware Descriptor
