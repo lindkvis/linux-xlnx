@@ -1492,6 +1492,9 @@ static void xilinx_cdma_start_transfer(struct xilinx_dma_chan *chan)
 	if (list_empty(&chan->pending_list))
 		return;
 
+	chan->tasklet_scheduling_failures = 0;
+	chan->max_tasklet_scheduling_failures = 0;
+
 	head_desc = list_first_entry(&chan->pending_list,
 				     struct xilinx_dma_tx_descriptor, node);
 	tail_desc = list_last_entry(&chan->pending_list,
