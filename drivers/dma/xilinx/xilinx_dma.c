@@ -215,7 +215,7 @@
 #define XILINX_MCDMA_BD_EOP			BIT(30)
 #define XILINX_MCDMA_BD_SOP			BIT(31)
 
-#define XILINX_DMA_MAX_RESCHEDULED_TASKLETS 24
+#define XILINX_DMA_MAX_RESCHEDULED_TASKLETS 32
 
 /**
  * struct xilinx_vdma_desc_hw - Hardware Descriptor
@@ -451,8 +451,8 @@ struct xilinx_dma_chan {
 	int (*stop_transfer)(struct xilinx_dma_chan *chan);
 	u16 tdest;
 	bool has_vflip;
-	int tasklet_scheduling_failures;
-	int max_tasklet_scheduling_failures;
+	int tasklets_to_reschedule;
+	int tasklet_rescheduling_failures;
 };
 
 /**
@@ -1004,13 +1004,12 @@ static void xilinx_schedule_tasklet_for_channel(struct xilinx_dma_chan *chan)
 	} else {
 		spin_lock(&chan->lock);
 
-		if (chan->tasklet_scheduling_failures < XILINX_DMA_MAX_RESCHEDULED_TASKLETS) {
-			chan->tasklet_scheduling_failures++;
+		if (chan->tasklets_to_reschedule <= XILINX_DMA_MAX_RESCHEDULED_TASKLETS) {
+			chan->tasklets_to_reschedule++;
+		} else {
+			chan->tasklet_rescheduling_failures++;
 		}
 
-		if (chan->tasklet_scheduling_failures > chan->max_tasklet_scheduling_failures) {
-			chan->max_tasklet_scheduling_failures = chan->tasklet_scheduling_failures;
-		}
 		spin_unlock(&chan->lock);
 	}
 }
@@ -1023,7 +1022,7 @@ static void xilinx_reschedule_tasklet_for_channel(struct xilinx_dma_chan *chan)
 {
 	if (!test_and_set_bit(TASKLET_STATE_SCHED, &(chan->tasklet.state))) {
 		__tasklet_hi_schedule(&chan->tasklet);		
-		chan->tasklet_scheduling_failures--;
+		chan->tasklets_to_reschedule--;
 	}
 }
 
@@ -1060,7 +1059,7 @@ static void xilinx_dma_chan_desc_cleanup(struct xilinx_dma_chan *chan)
 	spin_lock_irqsave(&chan->lock, flags);
 
 	/* Reschedule the tasklet if we have at least one uncorrected failure */
-	if (chan->tasklet_scheduling_failures > 0) {
+	if (chan->tasklets_to_reschedule > 0) {
 		xilinx_reschedule_tasklet_for_channel(chan);
 	}
 
@@ -1353,8 +1352,8 @@ static void xilinx_dma_start(struct xilinx_dma_chan *chan)
 	int err;
 	u32 val;
 
-	chan->tasklet_scheduling_failures = 0;
-	chan->max_tasklet_scheduling_failures = 0;
+	chan->tasklets_to_reschedule = 0;
+	chan->tasklet_rescheduling_failures = 0;
 
 	dma_ctrl_set(chan, XILINX_DMA_REG_DMACR, XILINX_DMA_DMACR_RUNSTOP);
 
@@ -1492,8 +1491,8 @@ static void xilinx_cdma_start_transfer(struct xilinx_dma_chan *chan)
 	if (list_empty(&chan->pending_list))
 		return;
 
-	chan->tasklet_scheduling_failures = 0;
-	chan->max_tasklet_scheduling_failures = 0;
+	chan->tasklets_to_reschedule = 0;
+	chan->tasklet_rescheduling_failures = 0;
 
 	head_desc = list_first_entry(&chan->pending_list,
 				     struct xilinx_dma_tx_descriptor, node);
@@ -2508,9 +2507,14 @@ static int xilinx_dma_terminate_all(struct dma_chan *dchan)
 	xilinx_dma_chan_reset(chan);
 
 	/* Report any issues with missed tasklets */
-	if (chan->tasklet_scheduling_failures > 0 || chan->max_tasklet_scheduling_failures > 0) {
+	if (chan->tasklets_to_reschedule > 0) {
+		dev_warn(chan->dev,
+			"Still had %d tasklets left to reschedule\n", chan->tasklets_to_reschedule);
+	}
+
+	if (chan->tasklet_rescheduling_failures > 0) {
 		dev_err(chan->dev,
-			"Failed to schedule tasklets for %d interrupts. Max was %d\n", chan->tasklet_scheduling_failures, chan->max_tasklet_scheduling_failures);
+			"Failed to re-schedule %d tasklets\n", chan->tasklet_rescheduling_failures);
 	}
 
 	/* Remove and free all of the descriptors in the lists */
