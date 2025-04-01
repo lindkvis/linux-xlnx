@@ -999,10 +999,10 @@ static u32 xilinx_dma_get_residue(struct xilinx_dma_chan *chan,
   */
 static void xilinx_schedule_tasklet_for_channel(struct xilinx_dma_chan *chan)
 {
+	spin_lock(&chan->lock);
 	if (!test_and_set_bit(TASKLET_STATE_SCHED, &(chan->tasklet.state))) {
 		__tasklet_hi_schedule(&chan->tasklet);
 	} else {
-		spin_lock(&chan->lock);
 
 		if (chan->tasklets_to_reschedule <= XILINX_DMA_MAX_RESCHEDULED_TASKLETS) {
 			chan->tasklets_to_reschedule++;
@@ -1010,8 +1010,8 @@ static void xilinx_schedule_tasklet_for_channel(struct xilinx_dma_chan *chan)
 			chan->tasklet_rescheduling_failures++;
 		}
 
-		spin_unlock(&chan->lock);
 	}
+	spin_unlock(&chan->lock);
 }
 
 /**
