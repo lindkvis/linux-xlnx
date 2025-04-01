@@ -1034,16 +1034,15 @@ static void xilinx_reschedule_tasklet_for_channel(struct xilinx_dma_chan *chan)
  * @flags: flags for spin lock
  */
 static void xilinx_dma_chan_handle_cyclic(struct xilinx_dma_chan *chan,
-					  struct xilinx_dma_tx_descriptor *desc,
-					  unsigned long *flags)
+					  struct xilinx_dma_tx_descriptor *desc)
 {
 	struct dmaengine_desc_callback cb;
 
 	dmaengine_desc_get_callback(&desc->async_tx, &cb);
 	if (dmaengine_desc_callback_valid(&cb)) {
-		spin_unlock_irqrestore(&chan->lock, *flags);
+		spin_unlock_irq(&chan->lock);
 		dmaengine_desc_callback_invoke(&cb, NULL);
-		spin_lock_irqsave(&chan->lock, *flags);
+		spin_lock_irq(&chan->lock);
 	}
 }
 
@@ -1054,9 +1053,8 @@ static void xilinx_dma_chan_handle_cyclic(struct xilinx_dma_chan *chan,
 static void xilinx_dma_chan_desc_cleanup(struct xilinx_dma_chan *chan)
 {
 	struct xilinx_dma_tx_descriptor *desc, *next;
-	unsigned long flags;
 
-	spin_lock_irqsave(&chan->lock, flags);
+	spin_lock_irq(&chan->lock);
 
 	/* Reschedule the tasklet if we have at least one uncorrected failure */
 	if (chan->tasklets_to_reschedule > 0) {
@@ -1067,7 +1065,7 @@ static void xilinx_dma_chan_desc_cleanup(struct xilinx_dma_chan *chan)
 		struct dmaengine_result result;
 
 		if (desc->cyclic) {
-			xilinx_dma_chan_handle_cyclic(chan, desc, &flags);
+			xilinx_dma_chan_handle_cyclic(chan, desc);
 			break;
 		}
 
@@ -1086,9 +1084,9 @@ static void xilinx_dma_chan_desc_cleanup(struct xilinx_dma_chan *chan)
 		result.residue = desc->residue;
 
 		/* Run the link descriptor callback function */
-		spin_unlock_irqrestore(&chan->lock, flags);
+		spin_unlock_irq(&chan->lock);
 		dmaengine_desc_get_callback_invoke(&desc->async_tx, &result);
-		spin_lock_irqsave(&chan->lock, flags);
+		spin_lock_irq(&chan->lock);
 
 		/* Run any dependencies, then free the descriptor */
 		dma_run_dependencies(&desc->async_tx);
@@ -1102,7 +1100,7 @@ static void xilinx_dma_chan_desc_cleanup(struct xilinx_dma_chan *chan)
 			break;
 	}
 
-	spin_unlock_irqrestore(&chan->lock, flags);
+	spin_unlock_irq(&chan->lock);
 }
 
 /**
