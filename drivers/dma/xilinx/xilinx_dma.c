@@ -1017,12 +1017,24 @@ static void xilinx_dma_chan_handle_cyclic(struct xilinx_dma_chan *chan,
 	 * period completion, regardless of tasklet coalescing.
 	 */
 	dmaengine_desc_get_callback(&desc->async_tx, &cb);
-	while (chan->periods_pending > 0) {
-		chan->periods_pending--;
-		if (dmaengine_desc_callback_valid(&cb)) {
-			spin_unlock_irq(&chan->lock);
-			dmaengine_desc_callback_invoke(&cb, NULL);
-			spin_lock_irq(&chan->lock);
+
+	/*
+	 * Snapshot the count and zero it out before looping. Any IRQs that
+	 * fire during callback execution will increment periods_pending again
+	 * and queue a new tasklet run via tasklet_hi_schedule, so they are
+	 * not lost. This prevents the loop from chasing a counter that keeps
+	 * growing if the DMA period rate is high.
+	 */
+	{
+		int to_invoke = chan->periods_pending;
+
+		chan->periods_pending = 0;
+		while (to_invoke-- > 0) {
+			if (dmaengine_desc_callback_valid(&cb)) {
+				spin_unlock_irq(&chan->lock);
+				dmaengine_desc_callback_invoke(&cb, NULL);
+				spin_lock_irq(&chan->lock);
+			}
 		}
 	}
 }
