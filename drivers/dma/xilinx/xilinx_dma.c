@@ -215,7 +215,6 @@
 #define XILINX_MCDMA_BD_EOP			BIT(30)
 #define XILINX_MCDMA_BD_SOP			BIT(31)
 
-#define XILINX_DMA_MAX_RESCHEDULED_TASKLETS 32
 
 /**
  * struct xilinx_vdma_desc_hw - Hardware Descriptor
@@ -412,7 +411,7 @@ struct xilinx_dma_tx_descriptor {
  * @stop_transfer: Differentiate b/w DMA IP's quiesce
  * @tdest: TDEST value for mcdma
  * @has_vflip: S2MM vertical flip
- * @tasklet_scheduling_failures: The number of interrupts where the tasklets couldn't be scheduled
+ * @periods_pending: Number of cyclic period completions not yet delivered to the callback
  */
 struct xilinx_dma_chan {
 	struct xilinx_dma_device *xdev;
@@ -451,8 +450,7 @@ struct xilinx_dma_chan {
 	int (*stop_transfer)(struct xilinx_dma_chan *chan);
 	u16 tdest;
 	bool has_vflip;
-	int tasklets_to_reschedule;
-	int tasklet_rescheduling_failures;
+	int periods_pending;
 };
 
 /**
@@ -993,37 +991,12 @@ static u32 xilinx_dma_get_residue(struct xilinx_dma_chan *chan,
 	return residue;
 }
 
-/**
-  * Since the tasklets are being reused, the regular tasklet_schedule() may
-  * fail if the tasklet was already being run.
-  */
 static void xilinx_schedule_tasklet_for_channel(struct xilinx_dma_chan *chan)
 {
 	spin_lock(&chan->lock);
-	if (!test_and_set_bit(TASKLET_STATE_SCHED, &(chan->tasklet.state))) {
-		__tasklet_hi_schedule(&chan->tasklet);
-	} else {
-
-		if (chan->tasklets_to_reschedule <= XILINX_DMA_MAX_RESCHEDULED_TASKLETS) {
-			chan->tasklets_to_reschedule++;
-		} else {
-			chan->tasklet_rescheduling_failures++;
-		}
-
-	}
+	chan->periods_pending++;
 	spin_unlock(&chan->lock);
-}
-
-/**
-  * Since the tasklets are being reused, the regular tasklet_schedule() may
-  * fail if the tasklet was already being run. Assumes the channel lock is already held.
-  */
-static void xilinx_reschedule_tasklet_for_channel(struct xilinx_dma_chan *chan)
-{
-	if (!test_and_set_bit(TASKLET_STATE_SCHED, &(chan->tasklet.state))) {
-		__tasklet_hi_schedule(&chan->tasklet);		
-		chan->tasklets_to_reschedule--;
-	}
+	tasklet_hi_schedule(&chan->tasklet);
 }
 
 
@@ -1038,11 +1011,19 @@ static void xilinx_dma_chan_handle_cyclic(struct xilinx_dma_chan *chan,
 {
 	struct dmaengine_desc_callback cb;
 
+	/*
+	 * Each IRQ represents one completed period. Drain all pending periods
+	 * in one tasklet run so the callback is invoked exactly once per
+	 * period completion, regardless of tasklet coalescing.
+	 */
 	dmaengine_desc_get_callback(&desc->async_tx, &cb);
-	if (dmaengine_desc_callback_valid(&cb)) {
-		spin_unlock_irq(&chan->lock);
-		dmaengine_desc_callback_invoke(&cb, NULL);
-		spin_lock_irq(&chan->lock);
+	while (chan->periods_pending > 0) {
+		chan->periods_pending--;
+		if (dmaengine_desc_callback_valid(&cb)) {
+			spin_unlock_irq(&chan->lock);
+			dmaengine_desc_callback_invoke(&cb, NULL);
+			spin_lock_irq(&chan->lock);
+		}
 	}
 }
 
@@ -1055,11 +1036,6 @@ static void xilinx_dma_chan_desc_cleanup(struct xilinx_dma_chan *chan)
 	struct xilinx_dma_tx_descriptor *desc, *next;
 
 	spin_lock_irq(&chan->lock);
-
-	/* Reschedule the tasklet if we have at least one uncorrected failure */
-	if (chan->tasklets_to_reschedule > 0) {
-		xilinx_reschedule_tasklet_for_channel(chan);
-	}
 
 	list_for_each_entry_safe(desc, next, &chan->done_list, node) {
 		struct dmaengine_result result;
@@ -1350,8 +1326,7 @@ static void xilinx_dma_start(struct xilinx_dma_chan *chan)
 	int err;
 	u32 val;
 
-	chan->tasklets_to_reschedule = 0;
-	chan->tasklet_rescheduling_failures = 0;
+	chan->periods_pending = 0;
 
 	dma_ctrl_set(chan, XILINX_DMA_REG_DMACR, XILINX_DMA_DMACR_RUNSTOP);
 
@@ -1489,8 +1464,7 @@ static void xilinx_cdma_start_transfer(struct xilinx_dma_chan *chan)
 	if (list_empty(&chan->pending_list))
 		return;
 
-	chan->tasklets_to_reschedule = 0;
-	chan->tasklet_rescheduling_failures = 0;
+	chan->periods_pending = 0;
 
 	head_desc = list_first_entry(&chan->pending_list,
 				     struct xilinx_dma_tx_descriptor, node);
@@ -2504,16 +2478,7 @@ static int xilinx_dma_terminate_all(struct dma_chan *dchan)
 
 	xilinx_dma_chan_reset(chan);
 
-	/* Report any issues with missed tasklets */
-	if (chan->tasklets_to_reschedule > 0) {
-		dev_warn(chan->dev,
-			"Still had %d tasklets left to reschedule\n", chan->tasklets_to_reschedule);
-	}
-
-	if (chan->tasklet_rescheduling_failures > 0) {
-		dev_err(chan->dev,
-			"Failed to re-schedule %d tasklets\n", chan->tasklet_rescheduling_failures);
-	}
+	chan->periods_pending = 0;
 
 	/* Remove and free all of the descriptors in the lists */
 	chan->terminating = true;
