@@ -1896,23 +1896,26 @@ static irqreturn_t xilinx_dma_irq_handler(int irq, void *data)
 		}
 	}
 
-	if (status & XILINX_DMA_DMASR_DLY_CNT_IRQ) {
-		/*
-		 * Device takes too long to do the transfer when user requires
-		 * responsiveness.
-		 */
-		dev_dbg(chan->dev, "Inter-packet latency too long\n");
-	}
-
 	if (status & XILINX_DMA_DMASR_FRM_CNT_IRQ) {
 		spin_lock(&chan->lock);
 		xilinx_dma_complete_descriptor(chan);
 		chan->idle = true;
 		chan->start_transfer(chan);
 		spin_unlock(&chan->lock);
+		/*
+		 * A real frame completed: advance periods_pending so the cyclic
+		 * callback fires exactly once per hardware completion.
+		 */
+		xilinx_schedule_tasklet_for_channel(chan);
+	} else {
+		/*
+		 * Delay-timeout or error IRQ only — wake the tasklet for
+		 * cleanup but do NOT advance periods_pending, as no descriptor
+		 * was completed and doing so would cause a spurious extra
+		 * callback on the next real completion.
+		 */
+		tasklet_hi_schedule(&chan->tasklet);
 	}
-	
-	xilinx_schedule_tasklet_for_channel(chan);
 
 	return IRQ_HANDLED;
 }
